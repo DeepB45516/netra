@@ -394,7 +394,8 @@
 
   // Reliable mobile detection: touch OR narrow width
   const isMobile = window.matchMedia('(max-width: 768px)').matches || ('ontouchstart' in window);
-  video.src = isMobile ? '/assets/intro-mobile.mp4' : '/assets/intro-pc.mp4';
+  video.src = (isMobile ? '/assets/intro-mobile.mp4' : '/assets/intro-pc.mp4') + '?t=' + Date.now();
+  video.load();
 
   window.dismissSplash = function() {
     splash.classList.add('gone');
