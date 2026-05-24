@@ -587,6 +587,78 @@ function renderOutOfEnergyState() {
     </div>`;
 }
 
+/* ── VOICE FEEDBACK ─────────────────────────────────────────────────────── */
+function speak(text) {
+  try {
+    if (!window.speechSynthesis) return;
+    speechSynthesis.cancel();
+    const utter = new SpeechSynthesisUtterance(String(text));
+    const lang = currentLanguage();
+    utter.lang = HTML_LANGS[lang] || "en";
+    utter.rate = 1;
+    utter.pitch = 1;
+    speechSynthesis.speak(utter);
+  } catch (e) { /* ignore */ }
+}
+
+function playAnswerVoice(correct) {
+  // Lightweight checks to avoid noisy playback during automated tests
+  if (typeof window === "undefined" || !window.speechSynthesis) return;
+  const safeCorrect = correct ? true : false;
+  if (safeCorrect) {
+    const phrases = [t("correctAnswerFeedback"), "Well done!", "Good job!"];
+    speak(phrases[Math.floor(Math.random() * phrases.length)]);
+  } else {
+    const phrases = [t("wrongAnswerFeedback"), "Not quite, try again.", "Oops, that's incorrect."];
+    speak(phrases[Math.floor(Math.random() * phrases.length)]);
+  }
+}
+
+/* ── SIMPLE SOUND EFFECTS (WebAudio) ────────────────────────────────────── */
+function createAudioContext() {
+  try {
+    if (!window._netraAudioCtx) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return null;
+      window._netraAudioCtx = new C();
+    }
+    return window._netraAudioCtx;
+  } catch (e) { return null; }
+}
+
+function playTone(freq, duration = 0.12, type = 'sine', volume = 0.12) {
+  try {
+    const ctx = createAudioContext();
+    if (!ctx) return;
+    const o = ctx.createOscillator();
+    const g = ctx.createGain();
+    o.type = type;
+    o.frequency.value = freq;
+    g.gain.value = volume;
+    o.connect(g);
+    g.connect(ctx.destination);
+    const now = ctx.currentTime;
+    o.start(now);
+    g.gain.setValueAtTime(volume, now);
+    g.gain.exponentialRampToValueAtTime(0.001, now + duration);
+    o.stop(now + duration + 0.02);
+  } catch (e) { /* ignore */ }
+}
+
+function playCorrectSound() {
+  try {
+    playTone(880, 0.06, 'triangle', 0.12);
+    setTimeout(() => playTone(1320, 0.05, 'sine', 0.10), 80);
+  } catch (e) { /* ignore */ }
+}
+
+function playWrongSound() {
+  try {
+    playTone(220, 0.08, 'sawtooth', 0.14);
+    setTimeout(() => playTone(160, 0.06, 'sine', 0.08), 80);
+  } catch (e) { /* ignore */ }
+}
+
 function renderEnergy() {
   const el = document.getElementById("energyValue");
   if (!el) return;
@@ -1397,6 +1469,11 @@ function recordQuizAnswer(optionIndex) {
     correct,
     message: correct ? t("correctAnswerFeedback") : t("wrongAnswerFeedback")
   };
+  // Play short voice feedback and a simple sound effect
+  try { playAnswerVoice(correct); } catch (e) { /* ignore */ }
+  try {
+    if (correct) playCorrectSound(); else playWrongSound();
+  } catch (e) { /* ignore */ }
   renderQuestion();
 }
 
