@@ -289,6 +289,19 @@
         style="width:100%;height:100%;object-fit:cover;display:block;"
         preload="metadata">
       </video>
+      <div id="splashLite" aria-hidden="true" style="
+        display:none;flex-direction:column;align-items:center;justify-content:center;
+        gap:12px;text-align:center;color:#fff;
+        font-family:'Nunito',sans-serif;
+      ">
+        <img src="/assets/logo.png" alt="" style="
+          width:84px;height:84px;border-radius:20px;background:#fff;padding:10px;
+          box-shadow:0 14px 38px rgba(0,0,0,.35);
+        " />
+        <strong style="
+          display:block;font-size:1.9rem;letter-spacing:.08em;font-weight:900;
+        ">NETRA</strong>
+      </div>
       <button id="splashSkip" onclick="dismissSplash()" style="
         position:absolute;bottom:28px;right:28px;
         background:rgba(255,255,255,.18);backdrop-filter:blur(6px);
@@ -302,9 +315,11 @@
     (function() {
       var splash = document.getElementById('splashOverlay');
       var video  = document.getElementById('splashVideo');
+      var liteSplash = document.getElementById('splashLite');
       var introKey = 'netraIntroSeen';
-      var isMobile = ('ontouchstart' in window) || (window.innerWidth <= 768);
-      var src = isMobile ? '/assets/intro-mobile.mp4' : '/assets/intro-pc.mp4';
+      var isMobile = (window.matchMedia && window.matchMedia('(max-width: 768px)').matches) ||
+        ((navigator.maxTouchPoints || 0) > 0 && window.innerWidth <= 1024);
+      var src = '/assets/intro-pc.mp4';
       var dismissed = false;
       var attemptedPlay = false;
       var hasPlayableFrame = false;
@@ -348,6 +363,15 @@
 
       if (storageGet(introKey) === '1') {
         dismissSplash(true);
+        return;
+      }
+
+      if (isMobile) {
+        video.removeAttribute('autoplay');
+        video.style.display = 'none';
+        if (liteSplash) liteSplash.style.display = 'flex';
+        splash.style.background = '#06131f';
+        setTimeout(function() { dismissSplash(); }, 850);
         return;
       }
 

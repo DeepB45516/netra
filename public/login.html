@@ -304,6 +304,10 @@
 <div id="splash">
   <video id="splashVideo" playsinline webkit-playsinline muted autoplay preload="metadata"
     style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block;"></video>
+  <div id="splashLite" aria-hidden="true" style="display:none;position:absolute;inset:0;flex-direction:column;align-items:center;justify-content:center;gap:12px;text-align:center;color:#fff;font-family:var(--ff-body);">
+    <img src="/assets/logo.png" alt="" style="width:84px;height:84px;border-radius:20px;background:#fff;padding:10px;box-shadow:0 14px 38px rgba(0,0,0,.35);"/>
+    <strong style="display:block;font-size:1.9rem;letter-spacing:.08em;font-weight:900;">NETRA</strong>
+  </div>
   <button id="splashSkip" onclick="dismissSplash()">Skip ›</button>
 </div>
 
@@ -391,13 +395,15 @@
 (function() {
   const splash = document.getElementById('splash');
   const video  = document.getElementById('splashVideo');
+  const liteSplash = document.getElementById('splashLite');
   const introKey = 'netraIntroSeen';
   let dismissed = false;
   let attemptedPlay = false;
   let hasPlayableFrame = false;
 
   // Reliable mobile detection: touch OR narrow width
-  const isMobile = window.matchMedia('(max-width: 768px)').matches || ('ontouchstart' in window);
+  const isMobile = window.matchMedia('(max-width: 768px)').matches ||
+    ((navigator.maxTouchPoints || 0) > 0 && window.innerWidth <= 1024);
 
   function storageGet(key) {
     try { return window.sessionStorage && sessionStorage.getItem(key); }
@@ -418,7 +424,7 @@
     } catch (error) {}
   }
 
-  window.dismissSplash = function(skipAnimation) {
+  const dismissSplash = window.dismissSplash = function(skipAnimation) {
     if (dismissed) return;
     dismissed = true;
     storageSet(introKey, '1');
@@ -439,12 +445,21 @@
     return;
   }
 
+  if (isMobile) {
+    video.removeAttribute('autoplay');
+    video.style.display = 'none';
+    if (liteSplash) liteSplash.style.display = 'flex';
+    splash.style.background = '#06131f';
+    setTimeout(() => dismissSplash(), 850);
+    return;
+  }
+
   video.muted = true;
   video.defaultMuted = true;
   video.playsInline = true;
   video.setAttribute('webkit-playsinline', 'true');
   video.preload = 'metadata';
-  video.src = isMobile ? '/assets/intro-mobile.mp4' : '/assets/intro-pc.mp4';
+  video.src = '/assets/intro-pc.mp4';
   video.load();
 
   function startVideo() {
