@@ -1,4 +1,5 @@
 const http = require("http");
+const { google } = require('googleapis');
 // Load .env file if present
 try {
   const envPath = require("path").join(__dirname, ".env");
@@ -87,360 +88,14 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-const LOCAL_DB_FILE = path.join(ROOT, "data", "local-db.json");
-let databaseMode = process.env.DATABASE_URL ? "postgres" : "local";
-let localDbCache = null;
-
-function isConnectionFailure(err) {
-  const code = err && err.code;
-  return ["ENOTFOUND", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ECONNRESET", "57P03"].includes(code)
-    || /getaddrinfo|connect|timeout/i.test(err && err.message ? err.message : "");
-}
-
-function cloneJson(value) {
-  return JSON.parse(JSON.stringify(value));
-}
-
-function buildStateTemplate() {
-  try {
-    const statePath = path.join(ROOT, "data", "app-state.json");
-    const raw = fs.readFileSync(statePath, "utf8");
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-function loadSeedAccounts() {
-  try {
-    const accountsPath = path.join(ROOT, "data", "accounts.json");
-    const raw = fs.readFileSync(accountsPath, "utf8");
-    const parsed = JSON.parse(raw);
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch {
-    return {};
-  }
-}
-
-function makeLocalUserRecord({ id, name, email, passwordHash, createdAt, profile }) {
-  return {
-    id,
-    name: name || "",
-    email: email || null,
-    password_hash: passwordHash || null,
-    created_at: createdAt || new Date().toISOString(),
-    xp: Number(profile?.xp || 0),
-    streak: Number(profile?.streak || 0),
-    avatar_data_url: profile?.avatarDataUrl || null,
-    role: profile?.role || "Student",
-    preferred_language: profile?.preferredLanguage || "English",
-    active_path_id: profile?.activePathId || "grades-6-8",
-    onboarded: profile?.onboarded ? 1 : 0,
-    last_activity_date: profile?.lastActivityDate || null
-  };
-}
-
-async function persistLocalDb() {
-  if (!localDbCache) return;
-  await fsp.mkdir(path.dirname(LOCAL_DB_FILE), { recursive: true });
-  await fsp.writeFile(LOCAL_DB_FILE, JSON.stringify(localDbCache, null, 2), "utf8");
-}
-
-async function ensureLocalDb() {
-  if (localDbCache) return localDbCache;
-
-  try {
-    const raw = await fsp.readFile(LOCAL_DB_FILE, "utf8");
-    localDbCache = JSON.parse(raw);
-    localDbCache.users = localDbCache.users || {};
-    localDbCache.states = localDbCache.states || {};
-    localDbCache.sessions = localDbCache.sessions || {};
-    localDbCache.emailToUserId = localDbCache.emailToUserId || {};
-    return localDbCache;
-  } catch {
-    const seedAccounts = loadSeedAccounts();
-    const templateState = buildStateTemplate();
-    const users = {};
-    const states = {};
-    const emailToUserId = {};
-    const accountEntries = Object.values(seedAccounts);
-    let templateClaimed = false;
-
-    for (const account of accountEntries) {
-      if (!account || !account.userId || !account.email) continue;
-      const normalizedEmail = account.email.toLowerCase().trim();
-      const state = templateState && !templateClaimed
-        ? cloneJson(templateState)
-        : createInitialState();
-
-      templateClaimed = true;
-      state.profile.id = account.userId;
-      state.profile.name = account.name || state.profile.name || "";
-      state.profile.createdAt = account.createdAt || state.profile.createdAt || new Date().toISOString();
-      if (!state.profile.onboarded) state.profile.onboarded = true;
-
-      users[account.userId] = makeLocalUserRecord({
-        id: account.userId,
-        name: account.name,
-        email: normalizedEmail,
-        passwordHash: account.passwordHash,
-        createdAt: account.createdAt,
-        profile: state.profile
-      });
-      states[account.userId] = state;
-      emailToUserId[normalizedEmail] = account.userId;
-    }
-
-    localDbCache = {
-      users,
-      states,
-      sessions: {},
-      emailToUserId
-    };
-    await persistLocalDb();
-    return localDbCache;
-  }
-}
-
-function localSortUsers(store) {
-  return Object.values(store.users).sort((a, b) => {
-    const xpDiff = Number(b.xp || 0) - Number(a.xp || 0);
-    if (xpDiff !== 0) return xpDiff;
-    const streakDiff = Number(b.streak || 0) - Number(a.streak || 0);
-    if (streakDiff !== 0) return streakDiff;
-    return String(a.created_at || "").localeCompare(String(b.created_at || ""));
-  });
-}
-
-async function localQuery(sql, params = []) {
-  const store = await ensureLocalDb();
-  const normalizedSql = sql.replace(/\s+/g, " ").trim().toUpperCase();
-
-  if (normalizedSql.startsWith("CREATE TABLE IF NOT EXISTS")) {
-    return [];
-  }
-
-  if (normalizedSql === "DELETE FROM SESSIONS WHERE EXPIRES_AT < $1") {
-    const cutoff = String(params[0] || "");
-    for (const [token, session] of Object.entries(store.sessions)) {
-      if (String(session.expiresAt || session.expires_at || "") < cutoff) {
-        delete store.sessions[token];
-      }
-    }
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql === "SELECT COUNT(1) AS COUNT FROM USERS") {
-    return [{ count: Object.keys(store.users).length }];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USERS") && normalizedSql.includes("ON CONFLICT (ID) DO NOTHING")) {
-    const [id, name, email, passwordHash, createdAt, xp, streak] = params;
-    const normalizedEmail = email ? String(email).toLowerCase().trim() : null;
-    if (!store.users[id]) {
-      store.users[id] = {
-        id,
-        name: name || "",
-        email: normalizedEmail,
-        password_hash: passwordHash || null,
-        created_at: createdAt || new Date().toISOString(),
-        xp: Number(xp || 0),
-        streak: Number(streak || 0),
-        avatar_data_url: null,
-        role: "Student",
-        preferred_language: "English",
-        active_path_id: "grades-6-8",
-        onboarded: 1,
-        last_activity_date: null
-      };
-      if (normalizedEmail) store.emailToUserId[normalizedEmail] = id;
-      if (!store.states[id]) {
-        const state = createInitialState();
-        state.profile.id = id;
-        state.profile.name = name || "";
-        state.profile.xp = Number(xp || 0);
-        state.profile.streak = Number(streak || 0);
-        state.profile.onboarded = true;
-        store.states[id] = state;
-      }
-      await persistLocalDb();
-    }
-    return [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USERS") && normalizedSql.includes("ON CONFLICT (EMAIL) DO NOTHING")) {
-    const [id, name, email, createdAt] = params;
-    const normalizedEmail = email ? String(email).toLowerCase().trim() : null;
-    if (normalizedEmail && store.emailToUserId[normalizedEmail]) {
-      return [];
-    }
-    store.users[id] = {
-      id,
-      name: name || "",
-      email: normalizedEmail,
-      password_hash: null,
-      created_at: createdAt || new Date().toISOString(),
-      xp: 0,
-      streak: 0,
-      avatar_data_url: null,
-      role: "Student",
-      preferred_language: "English",
-      active_path_id: "grades-6-8",
-      onboarded: 0,
-      last_activity_date: null
-    };
-    if (normalizedEmail) store.emailToUserId[normalizedEmail] = id;
-    if (!store.states[id]) {
-      const state = createInitialState();
-      state.profile.id = id;
-      state.profile.name = name || "";
-      store.states[id] = state;
-    }
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USERS") && !normalizedSql.includes("ON CONFLICT")) {
-    const [id, name, email, passwordHash, createdAt] = params;
-    const normalizedEmail = email ? String(email).toLowerCase().trim() : null;
-    store.users[id] = {
-      id,
-      name: name || "",
-      email: normalizedEmail,
-      password_hash: passwordHash || null,
-      created_at: createdAt || new Date().toISOString(),
-      xp: 0,
-      streak: 0,
-      avatar_data_url: null,
-      role: "Student",
-      preferred_language: "English",
-      active_path_id: "grades-6-8",
-      onboarded: 0,
-      last_activity_date: null
-    };
-    if (normalizedEmail) store.emailToUserId[normalizedEmail] = id;
-    if (!store.states[id]) {
-      const state = createInitialState();
-      state.profile.id = id;
-      state.profile.name = name || "";
-      store.states[id] = state;
-    }
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USER_STATE") && normalizedSql.includes("ON CONFLICT (USER_ID) DO NOTHING")) {
-    const [userId, stateJson] = params;
-    if (!store.states[userId]) {
-      store.states[userId] = JSON.parse(stateJson);
-      await persistLocalDb();
-    }
-    return [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO SESSIONS") && normalizedSql.includes("ON CONFLICT (TOKEN) DO UPDATE SET EXPIRES_AT=$4")) {
-    const [token, userId, createdAt, expiresAt] = params;
-    store.sessions[token] = { userId, createdAt, expiresAt };
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql === "SELECT USER_ID, EXPIRES_AT FROM SESSIONS WHERE TOKEN=$1") {
-    const token = params[0];
-    const session = store.sessions[token];
-    if (!session) return [];
-    return [{ user_id: session.userId, expires_at: session.expiresAt }];
-  }
-
-  if (normalizedSql === "DELETE FROM SESSIONS WHERE TOKEN=$1") {
-    const token = params[0];
-    if (token && store.sessions[token]) {
-      delete store.sessions[token];
-      await persistLocalDb();
-    }
-    return [];
-  }
-
-  if (normalizedSql === "SELECT * FROM USERS WHERE EMAIL=$1") {
-    const email = String(params[0] || "").toLowerCase().trim();
-    const userId = store.emailToUserId[email];
-    return userId ? [store.users[userId]] : [];
-  }
-
-  if (normalizedSql === "SELECT * FROM USERS WHERE ID=$1") {
-    const userId = params[0];
-    return store.users[userId] ? [store.users[userId]] : [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USERS") && normalizedSql.includes("ON CONFLICT (ID) DO UPDATE SET")) {
-    const [userId, name, email, passwordHash, createdAt, xp, streak, avatarDataUrl, role, preferredLanguage, activePathId, onboarded, lastActivityDate] = params;
-    const existing = store.users[userId] || {};
-    const normalizedEmail = email ? String(email).toLowerCase().trim() : existing.email || null;
-    store.users[userId] = {
-      id: userId,
-      name: name || existing.name || "",
-      email: normalizedEmail,
-      password_hash: passwordHash || existing.password_hash || null,
-      created_at: createdAt || existing.created_at || new Date().toISOString(),
-      xp: Number(xp || 0),
-      streak: Number(streak || 0),
-      avatar_data_url: avatarDataUrl || null,
-      role: role || "Student",
-      preferred_language: preferredLanguage || "English",
-      active_path_id: activePathId || "grades-6-8",
-      onboarded: onboarded ? 1 : 0,
-      last_activity_date: lastActivityDate || null
-    };
-    if (normalizedEmail) store.emailToUserId[normalizedEmail] = userId;
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql === "SELECT STATE_JSON FROM USER_STATE WHERE USER_ID=$1") {
-    const userId = params[0];
-    const state = store.states[userId];
-    return state ? [{ state_json: JSON.stringify(state) }] : [];
-  }
-
-  if (normalizedSql.startsWith("INSERT INTO USER_STATE") && normalizedSql.includes("ON CONFLICT (USER_ID) DO UPDATE SET STATE_JSON=$2, UPDATED_AT=$3")) {
-    const [userId, stateJson] = params;
-    store.states[userId] = JSON.parse(stateJson);
-    await persistLocalDb();
-    return [];
-  }
-
-  if (normalizedSql === "SELECT ID, NAME, XP, STREAK FROM USERS ORDER BY XP DESC, STREAK DESC, CREATED_AT ASC") {
-    return localSortUsers(store).map((user) => ({
-      id: user.id,
-      name: user.name,
-      xp: user.xp,
-      streak: user.streak,
-      created_at: user.created_at
-    }));
-  }
-
-  throw new Error(`Local DB does not support query: ${sql}`);
-}
-
 // Helper: run a query and return rows
 async function q(sql, params = []) {
-  if (databaseMode !== "postgres") {
-    return localQuery(sql, params);
-  }
-  let client;
+  const client = await pool.connect();
   try {
-    client = await pool.connect();
-    return (await client.query(sql, params)).rows;
-  } catch (err) {
-    if (isConnectionFailure(err)) {
-      databaseMode = "local";
-      console.warn(`⚠️ Postgres unavailable, using local storage: ${err.message}`);
-      return localQuery(sql, params);
-    }
-    throw err;
+    const result = await client.query(sql, params);
+    return result.rows;
   } finally {
-    if (client) client.release();
+    client.release();
   }
 }
 async function q1(sql, params = []) {
@@ -689,7 +344,7 @@ function simpleHash(str) {
   try {
     await initDb();
     await seedDemoUsers();
-    console.log(databaseMode === "postgres" ? "✅ Database ready" : "✅ Local storage ready");
+    console.log("✅ Database ready");
   } catch (err) {
     console.error("❌ DB init failed:", err.message);
   }
@@ -1036,12 +691,10 @@ async function sendStatic(req, res, pathname) {
     }
     const extension = path.extname(filePath).toLowerCase();
     const isAsset = safePath.startsWith("/assets/");
-    const isVideo = extension === ".mp4";
     const headers = {
       "Content-Type": mimeTypes[extension] || "application/octet-stream",
-      "Cache-Control": isVideo
-        ? "public, max-age=31536000, immutable"
-        : isAsset ? "public, max-age=604800" : "public, max-age=120",
+      "Cache-Control": isAsset ? "public, max-age=604800" : "public, max-age=120",
+      "Content-Length": stat.size
     };
 
     if (extension === ".mp4") {
@@ -1679,37 +1332,12 @@ async function handleApi(req, res, url) {
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/api/questions-all") {
-      try {
-        const { loadQuestionBank } = require("./data/questions");
-        const bank = loadQuestionBank();
-        const all = [...bank.standard, ...bank.challenge];
-        // Also include all topics from all paths
-        const allPaths = getAllPaths();
-        const topicTexts = allPaths.flatMap(p => p.topics || []);
-        // Return all texts that need translating
-        const texts = new Set();
-        all.forEach(q => {
-          texts.add(q.prompt);
-          texts.add(q.explanation);
-          q.options.forEach(o => texts.add(o));
-          // correctAnswer is options[answer]
-          texts.add(q.options[q.answer]);
-        });
-        topicTexts.forEach(t => texts.add(t));
-        sendJson(res, 200, [...texts].filter(Boolean));
-      } catch(e) { sendError(res, 500, e.message); }
-      return;
-    }
-
     if (req.method === "GET" && url.pathname === "/api/leaderboard") { await getLeaderboard(res, url, activeUserId); return; }
     if (req.method === "GET" && url.pathname === "/api/quests")      { await getQuests(res, activeUserId); return; }
     if (req.method === "POST" && url.pathname === "/api/chatbot")    { await chatbotRespond(res, await readBody(req), activeUserId); return; }
     if (req.method === "POST" && url.pathname === "/api/logout")       { await handleLogout(req, res); return; }
     if (req.method === "POST" && url.pathname === "/api/signup")      { await handleSignup(req, res); return; }
     if (req.method === "POST" && url.pathname === "/api/login")       { await handleLogin(req, res); return; }
-    if (req.method === "POST" && url.pathname === "/api/auth/google") { await handleGoogleAuth(req, res); return; }
-    if (req.method === "GET"  && url.pathname === "/api/google-client-id") { sendJson(res, 200, { clientId: GOOGLE_CLIENT_ID || null }); return; }
     if (req.method === "GET"  && url.pathname === "/api/me")          { await handleMe(req, res); return; }
         sendError(res, 404, "API route not found");
   } catch (error) {
@@ -1757,92 +1385,88 @@ async function handleLogout(req, res) {
 
 // ── GOOGLE OAUTH ─────────────────────────────────────────────────────────────
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || "";
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || "";
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `http://localhost:${PORT}/auth/google/callback`;
+const oauth2Client = new google.auth.OAuth2(
+  GOOGLE_CLIENT_ID,
+  GOOGLE_CLIENT_SECRET,
+  GOOGLE_REDIRECT_URI
+);
 
-let _googleKeys = null;
-let _googleKeysFetchedAt = 0;
-async function getGooglePublicKeys() {
-  if (_googleKeys && Date.now() - _googleKeysFetchedAt < 5 * 60 * 1000) return _googleKeys;
-  const r = await fetch("https://www.googleapis.com/oauth2/v3/certs");
-  _googleKeys = await r.json();
-  _googleKeysFetchedAt = Date.now();
-  return _googleKeys;
+function redirectTo(res, location) {
+  res.writeHead(302, { Location: location });
+  res.end();
 }
 
-async function verifyGoogleIdToken(idToken) {
-  if (!GOOGLE_CLIENT_ID) throw new Error("GOOGLE_CLIENT_ID not configured");
-
-  // Ensure Web Crypto API is available (Node may need a shim)
-  if (typeof globalThis.crypto === 'undefined' && typeof require === 'function') {
-    try { globalThis.crypto = require('crypto').webcrypto; } catch (e) {}
-  }
-
-  const parts = idToken.split(".");
-  if (parts.length !== 3) throw new Error("Invalid JWT");
-
-  const decodeBase64Url = (s) => {
-    s = s.replace(/-/g, '+').replace(/_/g, '/');
-    while (s.length % 4) s += '=';
-    return Buffer.from(s, 'base64');
-  };
-
-  const header  = JSON.parse(decodeBase64Url(parts[0]).toString('utf8'));
-  const payload = JSON.parse(decodeBase64Url(parts[1]).toString('utf8'));
-  const now = Math.floor(Date.now() / 1000);
-  if (payload.exp < now) throw new Error("Token expired");
-  if (payload.aud !== GOOGLE_CLIENT_ID) throw new Error("Token audience mismatch");
-  if (payload.iss !== "https://accounts.google.com" && payload.iss !== "accounts.google.com")
-    throw new Error("Token issuer mismatch");
-
-  const { keys } = await getGooglePublicKeys();
-  const jwk = keys.find(k => k.kid === header.kid);
-  if (!jwk) throw new Error("Public key not found");
-
-  const subtle = globalThis.crypto && globalThis.crypto.subtle ? globalThis.crypto.subtle : null;
-  if (!subtle) throw new Error('WebCrypto.subtle not available in this environment');
-
-  const cryptoKey = await subtle.importKey(
-    "jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]
-  );
-
-  const signingInput = new TextEncoder().encode(parts[0] + "." + parts[1]);
-  const signature    = decodeBase64Url(parts[2]);
-  const valid = await subtle.verify(
-    "RSASSA-PKCS1-v1_5", cryptoKey, signature, signingInput
-  );
-  if (!valid) throw new Error("Signature invalid");
-  return payload;
+function redirectToLogin(res, message) {
+  const query = message ? `?google_error=${encodeURIComponent(message)}` : "";
+  redirectTo(res, `/login${query}`);
 }
 
-async function handleGoogleAuth(req, res) {
-  if (!GOOGLE_CLIENT_ID) {
-    sendError(res, 501, "Google Sign-In is not configured. Set GOOGLE_CLIENT_ID env var.");
+async function handleGoogleStart(req, res) {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    sendError(res, 501, "Google OAuth is not configured. Set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REDIRECT_URI.");
     return;
   }
-  const { credential } = await readBody(req);
-  if (!credential) { sendError(res, 400, "Missing credential"); return; }
-  let payload;
-  try { payload = await verifyGoogleIdToken(credential); }
-  catch (e) { sendError(res, 401, "Google token verification failed: " + e.message); return; }
-  const { email, name, sub: googleSub } = payload;
-  if (!email) { sendError(res, 400, "Google account has no email"); return; }
-  const emailKey = email.toLowerCase().trim();
-  let account = await getUserByEmail(emailKey);
-  if (!account) {
-    const userId = "goog-" + googleSub;
-    const now    = new Date().toISOString();
-    await q(`
-      INSERT INTO users (id, name, email, password_hash, created_at, xp, streak, role, preferred_language, active_path_id, onboarded)
-      VALUES ($1,$2,$3,NULL,$4,0,0,'Student','English','grades-6-8',0)
-      ON CONFLICT (email) DO NOTHING
-    `, [userId, name || emailKey.split("@")[0], emailKey, now]);
-    const initial = createInitialState();
-    initial.profile.name = name || emailKey.split("@")[0];
-    await writeState(userId, initial);
-    account = await getUserByEmail(emailKey);
+
+  const authUrl = oauth2Client.generateAuthUrl({
+    access_type: "offline",
+    scope: ["profile", "email"]
+  });
+  redirectTo(res, authUrl);
+}
+
+async function handleGoogleCallback(req, res, url) {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    redirectToLogin(res, "Google OAuth is not configured.");
+    return;
   }
-  const token = await createDbSession(account.id);
-  setSessionCookie(res, token);
-  sendJson(res, 200, { ok: true, name: account.name });
+
+  if (url.searchParams.get("error")) {
+    redirectToLogin(res, "Google sign-in was cancelled.");
+    return;
+  }
+
+  const code = url.searchParams.get("code");
+  if (!code) {
+    redirectToLogin(res, "Missing Google authorization code.");
+    return;
+  }
+
+  try {
+    const { tokens } = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({ version: "v2", auth: oauth2Client });
+    const { data } = await oauth2.userinfo.get();
+    const email = data.email ? data.email.toLowerCase().trim() : "";
+    const name = data.name || data.given_name || email.split("@")[0] || "Google User";
+
+    if (!email) {
+      throw new Error("Google account has no email");
+    }
+
+    let account = await getUserByEmail(email);
+    if (!account) {
+      const userId = data.id ? `goog-${data.id}` : `goog-${randomUUID()}`;
+      const now = new Date().toISOString();
+      await q(`
+        INSERT INTO users (id, name, email, password_hash, created_at, xp, streak, role, preferred_language, active_path_id, onboarded)
+        VALUES ($1,$2,$3,NULL,$4,0,0,'Student','English','grades-6-8',0)
+        ON CONFLICT (email) DO NOTHING
+      `, [userId, name, email, now]);
+      const initial = createInitialState();
+      initial.profile.name = name;
+      await writeState(userId, initial);
+      account = await getUserByEmail(email);
+    }
+
+    const token = await createDbSession(account.id);
+    setSessionCookie(res, token);
+    redirectTo(res, "/");
+  } catch (error) {
+    redirectToLogin(res, `Google login failed: ${error.message}`);
+  }
 }
 
 const server = http.createServer(async (req, res) => {
@@ -1850,6 +1474,16 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname.startsWith("/api/")) {
     await handleApi(req, res, url);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/auth/google") {
+    await handleGoogleStart(req, res);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/auth/google/callback") {
+    await handleGoogleCallback(req, res, url);
     return;
   }
 
@@ -1864,6 +1498,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
   }
+
+  if (url.pathname === "/dashboard") {
+    redirectTo(res, "/");
+    return;
+  }
+
   // Serve login page without auth check
   if (url.pathname === "/login" || url.pathname === "/login.html") {
     const loginPath = path.join(__dirname, "public", "login.html");
